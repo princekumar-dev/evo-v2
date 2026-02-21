@@ -7,6 +7,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config();
 
 async function runCommand(cmd, args = []) {
   return new Promise((resolve, reject) => {
