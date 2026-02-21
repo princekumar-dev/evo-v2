@@ -1,0 +1,16 @@
+node_modules
+.git
+.DS_Store
+.env
+.env.local
+dist
+.eslintcache
+.husky
+.vscode
+.cursor
+Docker
+Extras
+prisma/migrations
+prisma/*-migrations
+npm-debug.log
+yarn-error.log
