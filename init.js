@@ -99,26 +99,16 @@ async function main() {
       console.log(`⚠️  Migrations folder ${migrationsSourcePath} not found, skipping copy\n`);
     }
 
-    // Run migrations using db push for bouncer (pooled) connections,
-    // since 'migrate deploy' requires a direct connection which may be
-    // unreachable from hosted environments like Render.
+    // Deploy database schema: try migrate deploy first, fall back to db push
+    // if migration fails (e.g., non-empty DB without migration history, or
+    // unreachable direct connection for pooled setups).
     console.log('2️⃣  Deploying database schema...');
-    if (dbProvider === 'psql_bouncer') {
-      // For psql_bouncer: try migrate deploy first (uses directUrl internally),
-      // if that fails fall back to db push which works over the pooled connection.
-      const migrateCode = await runCommand('npx', ['prisma', 'migrate', 'deploy', '--schema', schemaFile]);
-      if (migrateCode !== 0) {
-        console.log('⚠️  migrate deploy failed (direct connection likely unreachable), falling back to prisma db push...');
-        const pushCode = await runCommand('npx', ['prisma', 'db', 'push', '--schema', schemaFile, '--accept-data-loss']);
-        if (pushCode !== 0) {
-          console.error('❌ Database schema push failed');
-          process.exit(1);
-        }
-      }
-    } else {
-      const migrateCode = await runCommand('npx', ['prisma', 'migrate', 'deploy', '--schema', schemaFile]);
-      if (migrateCode !== 0) {
-        console.error('❌ Database migration failed');
+    const migrateCode = await runCommand('npx', ['prisma', 'migrate', 'deploy', '--schema', schemaFile]);
+    if (migrateCode !== 0) {
+      console.log('⚠️  migrate deploy failed, falling back to prisma db push...');
+      const pushCode = await runCommand('npx', ['prisma', 'db', 'push', '--schema', schemaFile, '--accept-data-loss']);
+      if (pushCode !== 0) {
+        console.error('❌ Database schema push also failed');
         process.exit(1);
       }
     }
