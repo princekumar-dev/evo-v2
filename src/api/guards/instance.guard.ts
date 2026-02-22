@@ -1,8 +1,11 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { cache, prismaRepository, waMonitor } from '@api/server.module';
 import { CacheConf, configService } from '@config/env.config';
+import { Logger } from '@config/logger.config';
 import { BadRequestException, ForbiddenException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import { NextFunction, Request, Response } from 'express';
+
+const logger = new Logger('InstanceGuard');
 
 async function getInstance(instanceName: string) {
   try {
@@ -42,10 +45,47 @@ export async function instanceExistsGuard(req: Request, _: Response, next: NextF
 export async function instanceLoggedGuard(req: Request, _: Response, next: NextFunction) {
   if (req.originalUrl.includes('/instance/create')) {
     const instance = req.body as InstanceDto;
-    if (await getInstance(instance.instanceName)) {
-      throw new ForbiddenException(`This name "${instance.instanceName}" is already in use.`);
+    const existsInMemory = !!waMonitor.waInstances[instance.instanceName];
+    const existsAnywhere = await getInstance(instance.instanceName);
+
+    if (existsAnywhere) {
+      // Instance exists in DB — check if it's actually alive and connected
+      if (existsInMemory) {
+        const status = waMonitor.waInstances[instance.instanceName]?.connectionStatus;
+        const state = typeof status === 'string' ? status : status?.state;
+
+        if (state === 'open' || state === 'connecting') {
+          // Truly active instance — block creation
+          throw new ForbiddenException(`This name "${instance.instanceName}" is already in use.`);
+        }
+      }
+
+      // Instance exists in DB but is NOT actively connected (stale after cold start)
+      // Clean up the stale instance so the user can re-create and reconnect
+      logger.info(
+        `Instance "${instance.instanceName}" found in database but not actively connected. ` +
+          `Cleaning up stale record to allow re-creation (Render cold start recovery).`,
+      );
+
+      try {
+        // Remove from memory if partially loaded
+        if (waMonitor.waInstances[instance.instanceName]) {
+          delete waMonitor.waInstances[instance.instanceName];
+        }
+
+        // Delete the stale DB record so createInstance can insert fresh
+        await prismaRepository.instance.deleteMany({ where: { name: instance.instanceName } });
+        logger.info(`Cleaned up stale instance "${instance.instanceName}" from database`);
+      } catch (cleanupError) {
+        logger.error(`Failed to clean up stale instance: ${cleanupError?.message}`);
+        throw new ForbiddenException(
+          `This name "${instance.instanceName}" is already in use and cleanup failed. ` +
+            `Try deleting it first via DELETE /instance/delete/${instance.instanceName}.`,
+        );
+      }
     }
 
+    // Final cleanup of any leftover in-memory reference
     if (waMonitor.waInstances[instance.instanceName]) {
       delete waMonitor.waInstances[instance.instanceName];
     }

@@ -382,9 +382,22 @@ export class WAMonitoringService {
 
     this.logger.info({ msg: 'Loaded instances from Postgres', clientName, count: instances.length });
 
-    await Promise.all(
-      instances.map(async (instance) => {
-        this.setInstance({
+    // Process instances sequentially to avoid race conditions during cold start
+    for (const instance of instances) {
+      try {
+        // On cold start (e.g. Render wake-up), instances may still show 'open'
+        // from the previous run. Force them to auto-reconnect.
+        const effectiveStatus = instance.connectionStatus === 'close' ? 'close' : instance.connectionStatus;
+
+        this.logger.info({
+          msg: 'Restoring instance from database',
+          instanceName: instance.name,
+          instanceId: instance.id,
+          dbStatus: instance.connectionStatus,
+          effectiveStatus,
+        });
+
+        await this.setInstance({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,
@@ -392,10 +405,19 @@ export class WAMonitoringService {
           number: instance.number,
           businessId: instance.businessId,
           ownerJid: instance.ownerJid,
-          connectionStatus: instance.connectionStatus as any, // Pass connection status
+          connectionStatus: effectiveStatus as any,
         });
-      }),
-    );
+
+        this.logger.info({ msg: 'Instance restored successfully', instanceName: instance.name });
+      } catch (error) {
+        this.logger.error({
+          msg: 'Failed to restore instance from database — will skip',
+          instanceName: instance.name,
+          instanceId: instance.id,
+          error: error?.message || error,
+        });
+      }
+    }
   }
 
   private async loadInstancesFromProvider() {

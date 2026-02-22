@@ -5,7 +5,7 @@ import '@utils/instrumentSentry';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
-import { eventManager, waMonitor } from '@api/server.module';
+import { eventManager, prismaRepository, waMonitor } from '@api/server.module';
 import {
   Auth,
   configService,
@@ -29,6 +29,44 @@ import { join } from 'path';
 
 async function initWA() {
   await waMonitor.loadInstance();
+}
+
+// Graceful shutdown: mark all in-memory instances as 'close' in DB
+// so they auto-reconnect properly on next cold start (Render, etc.)
+function setupGracefulShutdown() {
+  const shutdownLogger = new Logger('SHUTDOWN');
+  let shuttingDown = false;
+
+  const handleShutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    shutdownLogger.info(`${signal} received — marking instances as close in database`);
+
+    try {
+      const instanceNames = Object.keys(waMonitor.waInstances);
+      if (instanceNames.length > 0) {
+        // Bulk-update all instances belonging to this process to 'connecting'
+        // so on next startup they will auto-reconnect
+        const ids = instanceNames.map((name) => waMonitor.waInstances[name]?.instanceId).filter(Boolean);
+
+        if (ids.length > 0) {
+          await prismaRepository.instance.updateMany({
+            where: { id: { in: ids } },
+            data: { connectionStatus: 'connecting' },
+          });
+          shutdownLogger.info(`Marked ${ids.length} instance(s) for auto-reconnect on next startup`);
+        }
+      }
+    } catch (err) {
+      shutdownLogger.error('Failed to update instances on shutdown: ' + err?.message);
+    }
+
+    // Give a moment for DB write to complete, then exit
+    setTimeout(() => process.exit(0), 1500);
+  };
+
+  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+  process.on('SIGINT', () => handleShutdown('SIGINT'));
 }
 
 async function bootstrap() {
@@ -172,6 +210,8 @@ async function bootstrap() {
   });
 
   onUnexpectedError();
+
+  setupGracefulShutdown();
 }
 
 bootstrap();
