@@ -263,6 +263,31 @@ export class BaileysStartupService extends ChannelStartupService {
   // Tracks the current socket so stale event handlers from old sockets are ignored
   private currentSocketRef: WASocket | null = null;
 
+  /**
+   * When an update-by-ID fails with P2025, the DB row likely exists under a
+   * different ID (e.g. the instance was recreated after a cold-start cleanup).
+   * Look up the row by name and sync `this.instanceId` so subsequent queries work.
+   */
+  private async syncInstanceIdFromDb(): Promise<boolean> {
+    try {
+      const existing = await this.prismaRepository.instance.findFirst({
+        where: { name: this.instance.name },
+      });
+      if (existing) {
+        this.logger.info({
+          msg: 'Syncing instanceId to match existing DB row (instance was likely recreated)',
+          oldId: this.instanceId,
+          newId: existing.id,
+        });
+        this.instanceId = existing.id;
+        return true;
+      }
+    } catch (err) {
+      this.logger.error({ msg: 'syncInstanceIdFromDb lookup failed', err: err?.toString() });
+    }
+    return false;
+  }
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -439,17 +464,31 @@ export class BaileysStartupService extends ChannelStartupService {
       } catch (err) {
         const code = (err as any)?.code;
         if (code === 'P2025') {
-          this.logger.warn({
-            msg: 'Instance row not found when updating connectionStatus to connecting; skipping update',
-            instanceId: this.instanceId,
-          });
-          try {
-            await this.prismaRepository.instance.create({
-              data: { id: this.instanceId, name: this.instance.name, connectionStatus: 'connecting' as any },
-            });
-            this.logger.info({ msg: 'Created missing instance row after failed update', instanceId: this.instanceId });
-          } catch (createErr) {
-            this.logger.error({ msg: 'Failed to create missing instance row', err: createErr?.toString() });
+          // Row not found by ID — the instance may have been recreated with a new ID.
+          // Sync the in-memory ID to match the DB row (looked up by name).
+          const synced = await this.syncInstanceIdFromDb();
+          if (synced) {
+            try {
+              await this.prismaRepository.instance.update({
+                where: { id: this.instanceId },
+                data: { connectionStatus: 'connecting' },
+              });
+            } catch (retryErr) {
+              this.logger.error({ msg: 'Failed to update connectionStatus after ID sync', err: retryErr?.toString() });
+            }
+          } else {
+            // Truly missing — create a new row
+            try {
+              await this.prismaRepository.instance.create({
+                data: { id: this.instanceId, name: this.instance.name, connectionStatus: 'connecting' as any },
+              });
+              this.logger.info({
+                msg: 'Created missing instance row after failed update',
+                instanceId: this.instanceId,
+              });
+            } catch (createErr) {
+              this.logger.error({ msg: 'Failed to create missing instance row', err: createErr?.toString() });
+            }
           }
         } else {
           this.logger.error({ msg: 'Failed to update instance connectionStatus', err: err?.toString() });
@@ -550,10 +589,30 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (err) {
           const code = (err as any)?.code;
           if (code === 'P2025') {
-            this.logger.warn({
-              msg: 'Instance row not found when updating connectionStatus to close; skipping update',
-              instanceId: this.instanceId,
-            });
+            const synced = await this.syncInstanceIdFromDb();
+            if (synced) {
+              try {
+                await this.prismaRepository.instance.update({
+                  where: { id: this.instanceId },
+                  data: {
+                    connectionStatus: 'close',
+                    disconnectionAt: new Date(),
+                    disconnectionReasonCode: statusCode,
+                    disconnectionObject: JSON.stringify(lastDisconnect),
+                  },
+                });
+              } catch (retryErr) {
+                this.logger.error({
+                  msg: 'Failed to update connectionStatus to close after ID sync',
+                  err: retryErr?.toString(),
+                });
+              }
+            } else {
+              this.logger.warn({
+                msg: 'Instance row not found when updating connectionStatus to close; skipping update',
+                instanceId: this.instanceId,
+              });
+            }
           } else {
             this.logger.error({ msg: 'Failed to update instance on close', err: err?.toString() });
           }
@@ -613,24 +672,41 @@ export class BaileysStartupService extends ChannelStartupService {
       } catch (err) {
         const code = (err as any)?.code;
         if (code === 'P2025') {
-          this.logger.warn({
-            msg: 'Instance row not found when updating connectionStatus to open; attempting to create row',
-            instanceId: this.instanceId,
-          });
-          try {
-            await this.prismaRepository.instance.create({
-              data: {
-                id: this.instanceId,
-                name: this.instance.name,
-                ownerJid: this.instance.wuid,
-                profileName: (await this.getProfileName()) as string,
-                profilePicUrl: this.instance.profilePictureUrl,
-                connectionStatus: 'open',
-              },
-            });
-            this.logger.info({ msg: 'Created missing instance row on open', instanceId: this.instanceId });
-          } catch (createErr) {
-            this.logger.error({ msg: 'Failed to create missing instance row on open', err: createErr?.toString() });
+          const synced = await this.syncInstanceIdFromDb();
+          if (synced) {
+            try {
+              await this.prismaRepository.instance.update({
+                where: { id: this.instanceId },
+                data: {
+                  ownerJid: this.instance.wuid,
+                  profileName: (await this.getProfileName()) as string,
+                  profilePicUrl: this.instance.profilePictureUrl,
+                  connectionStatus: 'open',
+                },
+              });
+            } catch (retryErr) {
+              this.logger.error({
+                msg: 'Failed to update connectionStatus to open after ID sync',
+                err: retryErr?.toString(),
+              });
+            }
+          } else {
+            // Truly missing — create a new row
+            try {
+              await this.prismaRepository.instance.create({
+                data: {
+                  id: this.instanceId,
+                  name: this.instance.name,
+                  ownerJid: this.instance.wuid,
+                  profileName: (await this.getProfileName()) as string,
+                  profilePicUrl: this.instance.profilePictureUrl,
+                  connectionStatus: 'open',
+                },
+              });
+              this.logger.info({ msg: 'Created missing instance row on open', instanceId: this.instanceId });
+            } catch (createErr) {
+              this.logger.error({ msg: 'Failed to create missing instance row on open', err: createErr?.toString() });
+            }
           }
         } else {
           this.logger.error({ msg: 'Failed to update instance on open', err: err?.toString() });
