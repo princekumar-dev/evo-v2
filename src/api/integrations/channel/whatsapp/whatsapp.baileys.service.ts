@@ -460,7 +460,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
+
+      // connectionReplaced (440) = a NEWER socket from this same device already
+      // took over.  Reconnecting would just create yet another socket that kicks
+      // the current one, causing an infinite loop.  Treat it as terminal.
+      const codesToNotReconnect = [
+        DisconnectReason.loggedOut, // 401
+        DisconnectReason.forbidden, // 403
+        DisconnectReason.connectionReplaced, // 440 — newer connection already active
+        402,
+        406,
+      ];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
       if (shouldReconnect) {
@@ -479,21 +489,29 @@ export class BaileysStartupService extends ChannelStartupService {
         } else {
           // Exponential backoff: 3s, 6s, 12s, 24s, 48s, 96s, 192s, 384s
           const delayMs = this.BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1);
-          const isConflict = statusCode === DisconnectReason.connectionReplaced; // 440
-          // Extra delay for conflict:replaced to let the old session fully close
-          const effectiveDelay = isConflict ? Math.max(delayMs, 10000) : delayMs;
 
           this.logger.info({
-            msg: `Reconnecting in ${effectiveDelay}ms (attempt ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS})`,
+            msg: `Reconnecting in ${delayMs}ms (attempt ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS})`,
             instance: this.instance.name,
             statusCode,
-            isConflictReplaced: isConflict,
           });
 
-          await new Promise((resolve) => setTimeout(resolve, effectiveDelay));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
           await this.connectToWhatsapp(this.phoneNumber);
           return; // Already handled, skip the "don't reconnect" block
         }
+      }
+
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        // 440 — a newer connection already replaced this one.
+        // Don't mark as 'close' in DB or emit logout; the newer socket is alive.
+        this.logger.info({
+          msg: 'Connection replaced by a newer socket — letting this old socket die quietly',
+          instance: this.instance.name,
+        });
+        this.client?.ws?.close();
+        this.client?.end(undefined);
+        return;
       }
 
       // Don't reconnect — terminal disconnect
@@ -830,6 +848,21 @@ export class BaileysStartupService extends ChannelStartupService {
     };
 
     this.endSession = false;
+
+    // Close any existing socket before creating a new one.
+    // Leaving the old socket alive causes WhatsApp to send
+    // conflict:replaced (440) which triggers a reconnect loop.
+    if (this.client) {
+      try {
+        this.client.ws?.removeAllListeners();
+        this.client.ws?.close();
+        this.client.end(undefined);
+      } catch (err) {
+        this.logger.warn({ msg: 'Error closing previous socket before reconnect', err: err?.message });
+      }
+      // Brief pause so WhatsApp registers the old socket as gone
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
 
     this.client = makeWASocket(socketConfig);
 
