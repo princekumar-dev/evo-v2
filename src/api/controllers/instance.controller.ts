@@ -308,11 +308,53 @@ export class InstanceController {
 
   public async connectToWhatsapp({ instanceName, number = null }: InstanceDto) {
     try {
-      const instance = this.waMonitor.waInstances[instanceName];
+      let instance = this.waMonitor.waInstances[instanceName];
+
+      // If not in memory, try to restore from DB (e.g. after cold start or removal + re-create)
+      if (!instance) {
+        const dbInstance = await this.prismaRepository.instance.findFirst({
+          where: { name: instanceName },
+        });
+
+        if (dbInstance) {
+          this.logger.info(`Instance "${instanceName}" not in memory but found in DB — auto-restoring`);
+
+          const restored = channelController.init(
+            { instanceName, integration: dbInstance.integration } as InstanceDto,
+            {
+              configService: this.configService,
+              eventEmitter: this.eventEmitter,
+              prismaRepository: this.prismaRepository,
+              cache: this.cache,
+              chatwootCache: this.chatwootCache,
+              baileysCache: this.baileysCache,
+              providerFiles: this.providerFiles,
+            },
+          );
+
+          if (restored) {
+            restored.setInstance({
+              instanceId: dbInstance.id,
+              instanceName: dbInstance.name,
+              integration: dbInstance.integration,
+              token: dbInstance.token,
+              number: dbInstance.number,
+              businessId: dbInstance.businessId,
+              ownerJid: dbInstance.ownerJid,
+            });
+
+            this.waMonitor.waInstances[instanceName] = restored;
+            instance = restored;
+          }
+        }
+      }
+
       const state = instance?.connectionStatus?.state;
 
       if (!state) {
-        throw new BadRequestException('The "' + instanceName + '" instance does not exist');
+        throw new BadRequestException(
+          'The "' + instanceName + '" instance does not exist. Please create it first via /instance/create.',
+        );
       }
 
       if (state == 'open') {
