@@ -257,6 +257,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MAX_RECONNECT_ATTEMPTS = 8;
   private readonly BASE_RECONNECT_DELAY_MS = 3000; // 3 seconds
 
+  // Connection mutex — prevents re-entrant calls to connectToWhatsapp/createClient
+  private isConnecting = false;
+
+  // Tracks the current socket so stale event handlers from old sockets are ignored
+  private currentSocketRef: WASocket | null = null;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -473,7 +479,7 @@ export class BaileysStartupService extends ChannelStartupService {
       ];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
-      if (shouldReconnect) {
+      if (shouldReconnect && !this.isConnecting) {
         this.reconnectAttempts++;
 
         // Prevent infinite reconnect loop
@@ -500,6 +506,13 @@ export class BaileysStartupService extends ChannelStartupService {
           await this.connectToWhatsapp(this.phoneNumber);
           return; // Already handled, skip the "don't reconnect" block
         }
+      } else if (shouldReconnect && this.isConnecting) {
+        this.logger.info({
+          msg: 'Skipping reconnect — a connection attempt is already in progress',
+          instance: this.instance.name,
+          statusCode,
+        });
+        return;
       }
 
       if (statusCode === DisconnectReason.connectionReplaced) {
@@ -890,6 +903,18 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    // Prevent re-entrant calls: if a connection is already being established,
+    // return the current client instead of creating a conflicting socket.
+    if (this.isConnecting) {
+      this.logger.info({
+        msg: 'connectToWhatsapp already in progress — skipping duplicate call',
+        instance: this.instance.name,
+      });
+      return this.client;
+    }
+
+    this.isConnecting = true;
+
     try {
       // Load instance config from DB — wrap each in try/catch so a
       // temporary DB outage (e.g. Supabase cold start) doesn't crash
@@ -914,10 +939,17 @@ export class BaileysStartupService extends ChannelStartupService {
         onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
       });
 
-      return await this.createClient(number);
+      const socket = await this.createClient(number);
+
+      // Track the current socket so stale event handlers can be identified
+      this.currentSocketRef = socket;
+
+      return socket;
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
+    } finally {
+      this.isConnecting = false;
     }
   }
 
@@ -2055,9 +2087,23 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    // Capture the socket reference at registration time.
+    // If this.client is later replaced by a new socket (reconnect), this
+    // handler must stop processing events to avoid stale close events from
+    // triggering duplicate reconnection cascades.
+    const registeredSocket = this.client;
+
     this.client.ev.process(async (events) => {
+      // Ignore events from an old socket that was already replaced
+      if (this.client !== registeredSocket) {
+        return;
+      }
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          // Double-check: socket may have been replaced while we were queued
+          if (this.client !== registeredSocket) return;
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
