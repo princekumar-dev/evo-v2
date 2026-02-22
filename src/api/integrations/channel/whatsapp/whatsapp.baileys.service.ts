@@ -252,6 +252,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
+  // Reconnect backoff state
+  private reconnectAttempts = 0;
+  private readonly MAX_RECONNECT_ATTEMPTS = 8;
+  private readonly BASE_RECONNECT_DELAY_MS = 3000; // 3 seconds
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -457,9 +462,42 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
-      } else {
+        this.reconnectAttempts++;
+
+        // Prevent infinite reconnect loop
+        if (this.reconnectAttempts > this.MAX_RECONNECT_ATTEMPTS) {
+          this.logger.error({
+            msg: `Max reconnect attempts (${this.MAX_RECONNECT_ATTEMPTS}) reached — stopping reconnection`,
+            instance: this.instance.name,
+            statusCode,
+            attempts: this.reconnectAttempts,
+          });
+          this.reconnectAttempts = 0;
+          // Fall through to the "don't reconnect" block below
+        } else {
+          // Exponential backoff: 3s, 6s, 12s, 24s, 48s, 96s, 192s, 384s
+          const delayMs = this.BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1);
+          const isConflict = statusCode === DisconnectReason.connectionReplaced; // 440
+          // Extra delay for conflict:replaced to let the old session fully close
+          const effectiveDelay = isConflict ? Math.max(delayMs, 10000) : delayMs;
+
+          this.logger.info({
+            msg: `Reconnecting in ${effectiveDelay}ms (attempt ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS})`,
+            instance: this.instance.name,
+            statusCode,
+            isConflictReplaced: isConflict,
+          });
+
+          await new Promise((resolve) => setTimeout(resolve, effectiveDelay));
+          await this.connectToWhatsapp(this.phoneNumber);
+          return; // Already handled, skip the "don't reconnect" block
+        }
+      }
+
+      // Don't reconnect — terminal disconnect
+      {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -507,6 +545,8 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      // Reset reconnect counter on successful connection
+      this.reconnectAttempts = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -818,10 +858,23 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
+      // Load instance config from DB — wrap each in try/catch so a
+      // temporary DB outage (e.g. Supabase cold start) doesn't crash
+      // the connection attempt with unhandled rejections.
+      await Promise.allSettled([
+        this.loadChatwoot().catch((err) => {
+          this.logger.warn({ msg: 'loadChatwoot failed (will use defaults)', err: err?.message });
+        }),
+        this.loadSettings().catch((err) => {
+          this.logger.warn({ msg: 'loadSettings failed (will use defaults)', err: err?.message });
+        }),
+        this.loadWebhook().catch((err) => {
+          this.logger.warn({ msg: 'loadWebhook failed (will use defaults)', err: err?.message });
+        }),
+        this.loadProxy().catch((err) => {
+          this.logger.warn({ msg: 'loadProxy failed (will use defaults)', err: err?.message });
+        }),
+      ]);
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({
